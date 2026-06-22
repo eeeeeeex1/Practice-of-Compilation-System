@@ -5,7 +5,7 @@
 
 CodeGenerator::CodeGenerator(std::ostream& output, bool optimize)
     : m_out(output), m_optimize(optimize), m_labelCounter(0) {
-    // Initialize register pool
+    // Initialize register pool (t0-t6 are caller-saved temporaries)
     m_freeRegs = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
 }
 
@@ -27,6 +27,7 @@ std::string CodeGenerator::newLabel(const std::string& prefix) {
 
 std::string CodeGenerator::allocReg() {
     if (m_freeRegs.empty()) {
+        // Spill to stack if no registers available
         throw std::runtime_error("Register allocation exhausted");
     }
     std::string reg = m_freeRegs.back();
@@ -36,7 +37,6 @@ std::string CodeGenerator::allocReg() {
 }
 
 void CodeGenerator::freeReg(const std::string& reg) {
-    // Find and move from used to free
     for (auto it = m_usedRegs.begin(); it != m_usedRegs.end(); ++it) {
         if (*it == reg) {
             m_usedRegs.erase(it);
@@ -58,23 +58,26 @@ void CodeGenerator::freeAllRegs() {
 void CodeGenerator::generate(const CompUnit& comp) {
     emitComment("ToyC Compiler - RISC-V 32 Assembly Output");
 
-    // Data section for global variables
-    emit(".data");
-    for (auto& decl : comp.globals) {
-        generateGlobal(decl.get());
+    // Data section for global variables and constants
+    if (!comp.globals.empty()) {
+        emit(".data");
+        for (auto& decl : comp.globals) {
+            generateGlobal(decl.get());
+        }
     }
 
     // Text section
     emit(".text");
 
-    // Entry point
+    // Entry point - call main and exit
     emit(".globl _start");
     emitLabel("_start");
     emit("call main");
-    emit("li a7, 93");    // exit syscall
-    emit("ecall");
+    emit("mv a0, a0");       // result already in a0
+    emit("li a7, 93");       // exit syscall number
+    emit("ecall");           // invoke syscall
 
-    // Generate function code
+    // Generate all functions
     for (auto& func : comp.functions) {
         generateFuncDef(func.get());
     }
@@ -86,6 +89,7 @@ void CodeGenerator::generateGlobal(const Decl* decl) {
     emit(".globl " + decl->name);
     emit(".balign 4");
     emitLabel(decl->name);
+    
     int initVal = 0;
     if (decl->init && decl->init->isConst) {
         initVal = decl->init->constValue;
@@ -97,14 +101,25 @@ void CodeGenerator::generateGlobal(const Decl* decl) {
 
 void CodeGenerator::generateFuncDef(const FuncDef* func) {
     m_currentFunc = func;
-    m_paramSaveOffset = -12;
+    freeAllRegs();
 
-    // Compute frame size (rounded to 16 bytes)
-    int frameSize = func->stackSize + 8;  // +8 for saved ra and fp
-    frameSize = ((frameSize + 15) / 16) * 16;  // Round up to 16-byte alignment
-
-    int raOffset = frameSize - 4;
-    int fpOffset = frameSize - 8;
+    // Compute frame size
+    // Layout: [saved regs] [local vars] [saved fp] [saved ra]
+    // fp points to saved fp location
+    // sp = fp - frameSize
+    
+    int localSize = func->stackSize;  // space for locals and params
+    int savedRegSize = 0;  // we save caller-saved regs if needed
+    
+    // Minimum frame: ra (4 bytes) + fp (4 bytes) = 8 bytes
+    int minFrame = 8 + localSize;
+    
+    // Round up to 16-byte alignment (RISC-V ABI requirement)
+    int frameSize = ((minFrame + 15) / 16) * 16;
+    
+    // Offsets within frame
+    int raOffset = frameSize - 4;   // ra saved at top of frame
+    int fpOffset = frameSize - 8;   // fp saved just below ra
 
     // Function label
     emit("");
@@ -118,27 +133,12 @@ void CodeGenerator::generateFuncDef(const FuncDef* func) {
     emit("sw fp, " + std::to_string(fpOffset) + "(sp)");
     emit("addi fp, sp, " + std::to_string(frameSize));
 
-    // Save parameters to stack
+    // Save parameters passed in a0-a7 to stack
     emitComment("Save parameters");
-    for (size_t i = 0; i < func->params.size(); i++) {
-        std::string aReg;
-        if (i < 8) {
-            aReg = "a" + std::to_string(i);
-        } else {
-            break;  // Only support up to 8 params for now
-        }
+    for (size_t i = 0; i < func->params.size() && i < 8; i++) {
         int offset = func->paramOffsets[i];
-        std::string offsetStr;
-        if (offset >= -2048 && offset < 2048) {
-            offsetStr = std::to_string(offset);
-        } else {
-            // Need lui + addi for large offsets
-            emit("lui t0, " + std::to_string((offset >> 12) & 0xFFFFF));
-            emit("add t0, t0, fp");
-            emit("sw " + aReg + ", 0(t0)");
-            continue;
-        }
-        emit("sw " + aReg + ", " + offsetStr + "(fp)");
+        std::string aReg = "a" + std::to_string(i);
+        emit("sw " + aReg + ", " + std::to_string(offset) + "(fp)");
     }
 
     // Generate function body
@@ -148,9 +148,9 @@ void CodeGenerator::generateFuncDef(const FuncDef* func) {
         }
     }
 
-    // Epilogue (for void functions that fall through or as default return)
-    // If we reach here, it's a void function or implicit return 0
-    emitLabel(newLabel("func_end"));
+    // Epilogue label (for void functions or fall-through)
+    std::string endLabel = func->name + "_end";
+    emitLabel(endLabel);
     emitComment("Epilogue");
     emit("lw ra, " + std::to_string(raOffset) + "(sp)");
     emit("lw fp, " + std::to_string(fpOffset) + "(sp)");
@@ -163,6 +163,8 @@ void CodeGenerator::generateFuncDef(const FuncDef* func) {
 // === Statement generation ===
 
 void CodeGenerator::generateStmt(const Stmt* stmt) {
+    if (!stmt) return;
+    
     switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* bs = dynamic_cast<const BlockStmt*>(stmt);
@@ -170,6 +172,7 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
             break;
         }
         case StmtKind::EMPTY:
+            // Empty statement - nothing to generate
             break;
 
         case StmtKind::EXPR: {
@@ -182,60 +185,51 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
             auto* as = dynamic_cast<const AssignStmt*>(stmt);
             std::string valReg = generateExpr(as->value.get());
 
-            // Store to variable
             if (as->varIsGlobal) {
+                // Global variable: use la + sw
                 emit("la t0, " + as->name);
                 emit("sw " + valReg + ", 0(t0)");
             } else {
+                // Local variable: store at offset from fp
                 int offset = as->varOffset;
-                std::string offsetStr;
-                if (offset >= -2048 && offset < 2048) {
-                    offsetStr = std::to_string(offset);
-                    emit("sw " + valReg + ", " + offsetStr + "(fp)");
-                } else {
-                    emit("lui t0, " + std::to_string((offset >> 12) & 0xFFFFF));
-                    emit("add t0, t0, fp");
-                    emit("sw " + valReg + ", 0(t0)");
-                }
+                emit("sw " + valReg + ", " + std::to_string(offset) + "(fp)");
             }
             freeReg(valReg);
             break;
         }
         case StmtKind::DECL: {
             auto* ds = dynamic_cast<const DeclStmt*>(stmt);
-            // Evaluate initializer and store
+            // Evaluate initializer
             std::string valReg = generateExpr(ds->decl->init.get());
+            
             if (!ds->decl->isGlobal) {
+                // Local declaration: store at assigned offset
                 int offset = ds->decl->varOffset;
-                if (offset >= -2048 && offset < 2048) {
-                    emit("sw " + valReg + ", " + std::to_string(offset) + "(fp)");
-                } else {
-                    emit("lui t0, " + std::to_string((offset >> 12) & 0xFFFFF));
-                    emit("add t0, t0, fp");
-                    emit("sw " + valReg + ", 0(t0)");
-                }
+                emit("sw " + valReg + ", " + std::to_string(offset) + "(fp)");
             }
             freeReg(valReg);
             break;
         }
         case StmtKind::IF: {
             auto* is = dynamic_cast<const IfStmt*>(stmt);
-            std::string condReg = generateExpr(is->condition.get());
-
+            
             std::string elseLabel = newLabel("else");
             std::string endLabel = newLabel("endif");
 
+            // Evaluate condition
+            std::string condReg = generateExpr(is->condition.get());
             emit("beqz " + condReg + ", " + elseLabel);
             freeReg(condReg);
 
+            // Then branch
             generateStmt(is->thenStmt.get());
-
+            
             if (is->elseStmt) {
                 emit("j " + endLabel);
             }
 
+            // Else branch
             emitLabel(elseLabel);
-
             if (is->elseStmt) {
                 generateStmt(is->elseStmt.get());
                 emitLabel(endLabel);
@@ -248,19 +242,21 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
             std::string startLabel = newLabel("while_start");
             std::string endLabel = newLabel("while_end");
 
+            // Push loop labels for break/continue
             m_loopStack.push({startLabel, endLabel});
 
+            // Loop start: check condition
             emitLabel(startLabel);
-
             std::string condReg = generateExpr(ws->condition.get());
             emit("beqz " + condReg + ", " + endLabel);
             freeReg(condReg);
 
+            // Loop body
             generateStmt(ws->body.get());
             emit("j " + startLabel);
 
+            // Loop end
             emitLabel(endLabel);
-
             m_loopStack.pop();
             break;
         }
@@ -278,33 +274,28 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
         }
         case StmtKind::RETURN: {
             auto* rs = dynamic_cast<const ReturnStmt*>(stmt);
+            
             if (rs->hasExpr) {
+                // Evaluate return value and move to a0
                 std::string retReg = generateExpr(rs->expr.get());
-                // Move result to a0
                 if (retReg != "a0") {
                     emit("mv a0, " + retReg);
                 }
                 freeReg(retReg);
             } else {
+                // Void return: set a0 = 0
                 emit("mv a0, zero");
             }
 
-            // Epilogue and return
-            int frameSize = m_currentFunc->stackSize + 8;
-            frameSize = ((frameSize + 15) / 16) * 16;
-            int raOffset = frameSize - 4;
-            int fpOffset = frameSize - 8;
-
-            emit("lw ra, " + std::to_string(raOffset) + "(sp)");
-            emit("lw fp, " + std::to_string(fpOffset) + "(sp)");
-            emit("addi sp, sp, " + std::to_string(frameSize));
-            emit("jr ra");
+            // Jump to function epilogue
+            emit("j " + m_currentFunc->name + "_end");
             break;
         }
     }
 }
 
 void CodeGenerator::generateBlock(const Block* block) {
+    if (!block) return;
     for (auto& stmt : block->stmts) {
         generateStmt(stmt.get());
     }
@@ -324,16 +315,29 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
             auto* ne = dynamic_cast<const NumberExpr*>(expr);
             std::string reg = allocReg();
             int val = ne->value;
-            if (val >= -2048 && val < 2048) {
+            
+            if (val == 0) {
+                emit("mv " + reg + ", zero");
+            } else if (val >= -2048 && val <= 2047) {
                 emit("li " + reg + ", " + std::to_string(val));
             } else {
-                // Load upper 20 bits, then add lower 12
+                // Large immediate: use lui + addi
                 int upper = (val >> 12) & 0xFFFFF;
                 int lower = val & 0xFFF;
-                if (lower & 0x800) lower |= ~0xFFF;  // sign-extend
+                // Handle sign extension for negative lower bits
+                if (lower & 0x800) {
+                    // lower is negative in 12-bit representation
+                    lower = lower | ~0xFFF;  // sign extend
+                    // Adjust upper if lower is negative
+                    if (val < 0 && lower != (val & 0xFFF)) {
+                        upper = ((val + 0x1000) >> 12) & 0xFFFFF;
+                        lower = (val + 0x1000) & 0xFFF;
+                        if (lower & 0x800) lower = lower - 0x1000;
+                    }
+                }
                 emit("lui " + reg + ", " + std::to_string(upper));
-                if (lower != 0) {
-                    emit("addi " + reg + ", " + reg + ", " + std::to_string(lower));
+                if ((val & 0xFFF) != 0) {
+                    emit("addi " + reg + ", " + reg + ", " + std::to_string(val & 0xFFF));
                 }
             }
             return reg;
@@ -342,18 +346,18 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
             auto* ie = dynamic_cast<const IdExpr*>(expr);
             std::string reg = allocReg();
 
-            if (ie->varIsGlobal) {
+            if (ie->varIsConst && ie->varIsGlobal) {
+                // Global constant: can load directly
+                emit("la " + reg + ", " + ie->name);
+                emit("lw " + reg + ", 0(" + reg + ")");
+            } else if (ie->varIsGlobal) {
+                // Global variable
                 emit("la " + reg + ", " + ie->name);
                 emit("lw " + reg + ", 0(" + reg + ")");
             } else {
+                // Local variable or parameter
                 int offset = ie->varOffset;
-                if (offset >= -2048 && offset < 2048) {
-                    emit("lw " + reg + ", " + std::to_string(offset) + "(fp)");
-                } else {
-                    emit("lui " + reg + ", " + std::to_string((offset >> 12) & 0xFFFFF));
-                    emit("add " + reg + ", " + reg + ", fp");
-                    emit("lw " + reg + ", 0(" + reg + ")");
-                }
+                emit("lw " + reg + ", " + std::to_string(offset) + "(fp)");
             }
             return reg;
         }
@@ -362,24 +366,23 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
 
             // Short-circuit evaluation for && and ||
             if (be->op == TokenType::TOK_AND) {
-                // left && right:
-                // Evaluate left, if false (zero), result is 0 (false), skip right
-                // If left is non-zero, evaluate right (result is 0 or 1)
                 std::string resultReg = allocReg();
-                std::string shortLabel = newLabel("sc_and");
+                std::string falseLabel = newLabel("and_false");
+                std::string endLabel = newLabel("and_end");
 
+                // Evaluate left
                 std::string leftReg = generateExpr(be->left.get());
-                emit("beqz " + leftReg + ", " + shortLabel);
+                emit("beqz " + leftReg + ", " + falseLabel);
                 freeReg(leftReg);
 
+                // Evaluate right (only if left was true)
                 std::string rightReg = generateExpr(be->right.get());
                 emit("snez " + resultReg + ", " + rightReg);
                 freeReg(rightReg);
-
-                std::string endLabel = newLabel("sc_and_end");
                 emit("j " + endLabel);
 
-                emitLabel(shortLabel);
+                // Left was false: result = 0
+                emitLabel(falseLabel);
                 emit("mv " + resultReg + ", zero");
 
                 emitLabel(endLabel);
@@ -387,24 +390,23 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
             }
 
             if (be->op == TokenType::TOK_OR) {
-                // left || right:
-                // Evaluate left, if true (non-zero), result is 1, skip right
-                // If left is zero, evaluate right (result is 0 or 1)
                 std::string resultReg = allocReg();
-                std::string shortLabel = newLabel("sc_or");
+                std::string trueLabel = newLabel("or_true");
+                std::string endLabel = newLabel("or_end");
 
+                // Evaluate left
                 std::string leftReg = generateExpr(be->left.get());
-                emit("bnez " + leftReg + ", " + shortLabel);
+                emit("bnez " + leftReg + ", " + trueLabel);
                 freeReg(leftReg);
 
+                // Evaluate right (only if left was false)
                 std::string rightReg = generateExpr(be->right.get());
                 emit("snez " + resultReg + ", " + rightReg);
                 freeReg(rightReg);
-
-                std::string endLabel = newLabel("sc_or_end");
                 emit("j " + endLabel);
 
-                emitLabel(shortLabel);
+                // Left was true: result = 1
+                emitLabel(trueLabel);
                 emit("li " + resultReg + ", 1");
 
                 emitLabel(endLabel);
@@ -414,60 +416,53 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
             // Normal binary operations
             std::string leftReg = generateExpr(be->left.get());
             std::string rightReg = generateExpr(be->right.get());
-            std::string resultReg = leftReg;  // result goes into left reg
 
             switch (be->op) {
                 case TokenType::TOK_ADD:
-                    emit("add " + resultReg + ", " + leftReg + ", " + rightReg);
+                    emit("add " + leftReg + ", " + leftReg + ", " + rightReg);
                     break;
                 case TokenType::TOK_SUB:
-                    emit("sub " + resultReg + ", " + leftReg + ", " + rightReg);
+                    emit("sub " + leftReg + ", " + leftReg + ", " + rightReg);
                     break;
                 case TokenType::TOK_MUL:
-                    emit("mul " + resultReg + ", " + leftReg + ", " + rightReg);
+                    emit("mul " + leftReg + ", " + leftReg + ", " + rightReg);
                     break;
                 case TokenType::TOK_DIV:
-                    emit("div " + resultReg + ", " + leftReg + ", " + rightReg);
+                    emit("div " + leftReg + ", " + leftReg + ", " + rightReg);
                     break;
                 case TokenType::TOK_MOD:
-                    emit("rem " + resultReg + ", " + leftReg + ", " + rightReg);
+                    emit("rem " + leftReg + ", " + leftReg + ", " + rightReg);
                     break;
                 case TokenType::TOK_LT:
-                    emit("slt " + resultReg + ", " + leftReg + ", " + rightReg);
+                    emit("slt " + leftReg + ", " + leftReg + ", " + rightReg);
                     break;
                 case TokenType::TOK_GT:
-                    emit("slt " + resultReg + ", " + rightReg + ", " + leftReg);
+                    emit("slt " + leftReg + ", " + rightReg + ", " + leftReg);
                     break;
-                case TokenType::TOK_LE: {
-                    // left <= right === !(right < left)
-                    emit("slt " + resultReg + ", " + rightReg + ", " + leftReg);
-                    emit("xori " + resultReg + ", " + resultReg + ", 1");
+                case TokenType::TOK_LE:
+                    // a <= b == !(b < a)
+                    emit("slt " + leftReg + ", " + rightReg + ", " + leftReg);
+                    emit("xori " + leftReg + ", " + leftReg + ", 1");
                     break;
-                }
-                case TokenType::TOK_GE: {
-                    // left >= right === !(left < right)
-                    emit("slt " + resultReg + ", " + leftReg + ", " + rightReg);
-                    emit("xori " + resultReg + ", " + resultReg + ", 1");
+                case TokenType::TOK_GE:
+                    // a >= b == !(a < b)
+                    emit("slt " + leftReg + ", " + leftReg + ", " + rightReg);
+                    emit("xori " + leftReg + ", " + leftReg + ", 1");
                     break;
-                }
-                case TokenType::TOK_EQ: {
-                    // left == right
-                    emit("sub " + resultReg + ", " + leftReg + ", " + rightReg);
-                    emit("seqz " + resultReg + ", " + resultReg);
+                case TokenType::TOK_EQ:
+                    emit("sub " + leftReg + ", " + leftReg + ", " + rightReg);
+                    emit("seqz " + leftReg + ", " + leftReg);
                     break;
-                }
-                case TokenType::TOK_NE: {
-                    // left != right
-                    emit("sub " + resultReg + ", " + leftReg + ", " + rightReg);
-                    emit("snez " + resultReg + ", " + resultReg);
+                case TokenType::TOK_NE:
+                    emit("sub " + leftReg + ", " + leftReg + ", " + rightReg);
+                    emit("snez " + leftReg + ", " + leftReg);
                     break;
-                }
                 default:
                     break;
             }
 
             freeReg(rightReg);
-            return resultReg;
+            return leftReg;
         }
         case ExprKind::UNARY: {
             auto* ue = dynamic_cast<const UnaryExpr*>(expr);
@@ -475,10 +470,10 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
 
             switch (ue->op) {
                 case TokenType::TOK_SUB:
-                    emit("sub " + opReg + ", zero, " + opReg);
+                    emit("neg " + opReg + ", " + opReg);
                     break;
                 case TokenType::TOK_ADD:
-                    // Unary plus is a no-op
+                    // Unary plus: no change
                     break;
                 case TokenType::TOK_NOT:
                     emit("seqz " + opReg + ", " + opReg);
@@ -491,25 +486,21 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
         case ExprKind::CALL: {
             auto* ce = dynamic_cast<const CallExpr*>(expr);
 
-            // Save caller-saved registers that are in use?
-            // For simplicity, save and restore t0-t6, a0-a7
-            int frameSize = 64;  // Enough to save 8 regs
-            emit("addi sp, sp, -" + std::to_string(frameSize));
-
-            // Save used temporary registers
-            int saveOffset = 0;
-            for (size_t i = 0; i < m_usedRegs.size() && i < 6; i++) {
-                emit("sw " + m_usedRegs[i] + ", " + std::to_string(saveOffset) + "(sp)");
-                saveOffset += 4;
-            }
-
-            // Save argument registers (a0-a7)
-            for (int i = 0; i < 8; i++) {
-                emit("sw a" + std::to_string(i) + ", " + std::to_string(saveOffset) + "(sp)");
-                saveOffset += 4;
+            // Save caller-saved registers (t0-t6) that are currently in use
+            // We need to save them because the callee may modify them
+            int savedCount = static_cast<int>(m_usedRegs.size());
+            int saveSize = savedCount * 4;
+            
+            if (saveSize > 0) {
+                emit("addi sp, sp, -" + std::to_string(saveSize));
+                for (int i = 0; i < savedCount; i++) {
+                    emit("sw " + m_usedRegs[i] + ", " + std::to_string(i * 4) + "(sp)");
+                }
             }
 
             // Evaluate arguments into a0-a7
+            // Note: we evaluate arguments AFTER saving temporaries
+            // because argument evaluation may use temporaries
             for (size_t i = 0; i < ce->args.size() && i < 8; i++) {
                 std::string argReg = generateExpr(ce->args[i].get());
                 emit("mv a" + std::to_string(i) + ", " + argReg);
@@ -519,36 +510,16 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
             // Call the function
             emit("call " + ce->funcName);
 
-            // Result is in a0
-            std::string resultReg;
-            if (ce->type == TypeKind::VOID) {
-                resultReg = allocReg();
-                emit("mv " + resultReg + ", a0");  // discard but keep consistent
-            } else {
-                resultReg = allocReg();
-                emit("mv " + resultReg + ", a0");
-            }
+            // Result is in a0 - move to a temporary
+            std::string resultReg = allocReg();
+            emit("mv " + resultReg + ", a0");
 
-            // Restore used registers
-            int restoreOffset = 0;
-            for (size_t i = 0; i < m_usedRegs.size() - 1 && i < 6; i++) {
-                emit("lw " + m_usedRegs[i] + ", " + std::to_string(restoreOffset) + "(sp)");
-                restoreOffset += 4;
-            }
-            // Skip the resultReg - restore the rest
-            restoreOffset = m_usedRegs.size() > 0 ? 4 * (std::min((int)m_usedRegs.size() - 1, 6)) : 0;
-
-            // Restore a0-a7
-            for (int i = 0; i < 8; i++) {
-                emit("lw a" + std::to_string(i) + ", " + std::to_string(restoreOffset) + "(sp)");
-                restoreOffset += 4;
-            }
-
-            emit("addi sp, sp, " + std::to_string(frameSize));
-
-            // Put a0 back (it was overwritten by the restore)
-            if (ce->type != TypeKind::VOID) {
-                emit("mv a0, " + resultReg);
+            // Restore saved temporaries
+            if (saveSize > 0) {
+                for (int i = 0; i < savedCount; i++) {
+                    emit("lw " + m_usedRegs[i] + ", " + std::to_string(i * 4) + "(sp)");
+                }
+                emit("addi sp, sp, " + std::to_string(saveSize));
             }
 
             return resultReg;
