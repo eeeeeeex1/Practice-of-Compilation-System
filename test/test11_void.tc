@@ -1,0 +1,10 @@
+int result = 0;
+
+void setResult(int val) {
+    result = val;
+}
+
+int main() {
+    setResult(99);
+    return result;
+}

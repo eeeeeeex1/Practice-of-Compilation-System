@@ -1,0 +1,25 @@
+# Build directory
+build/
+
+# IDE files
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Compiled output
+*.exe
+*.obj
+*.o
+*.out
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+
+# OS files
+.DS_Store
+Thumbs.db
+.claude/
