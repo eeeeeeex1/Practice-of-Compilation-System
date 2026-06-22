@@ -109,7 +109,6 @@ void CodeGenerator::generateFuncDef(const FuncDef* func) {
     // sp = fp - frameSize
     
     int localSize = func->stackSize;  // space for locals and params
-    int savedRegSize = 0;  // we save caller-saved regs if needed
     
     // Minimum frame: ra (4 bytes) + fp (4 bytes) = 8 bytes
     int minFrame = 8 + localSize;
