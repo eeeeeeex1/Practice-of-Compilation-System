@@ -320,27 +320,19 @@ ExprPtr Parser::parseLAndExpr() {
     return left;
 }
 
-// RelExpr → AddExpr ( ( "<" | ">" | "<=" | ">=" | "==" | "!=" ) AddExpr )?
-// Note: Only one relational operator allowed (no chaining)
+// RelExpr -> AddExpr ( ( "<" | ">" | "<=" | ">=" | "==" | "!=" ) AddExpr )*
 ExprPtr Parser::parseRelExpr() {
     ExprPtr left = parseAddExpr();
     Token tok = peek();
 
-    switch (tok.type) {
-        case TokenType::TOK_LT:
-        case TokenType::TOK_GT:
-        case TokenType::TOK_LE:
-        case TokenType::TOK_GE:
-        case TokenType::TOK_EQ:
-        case TokenType::TOK_NE: {
-            consume();
-            ExprPtr right = parseAddExpr();
-            // Relation operators are non-associative; don't loop
-            return std::make_unique<BinaryExpr>(tok, tok.type,
-                                                std::move(left), std::move(right));
-        }
-        default:
-            break;
+    while (tok.type == TokenType::TOK_LT || tok.type == TokenType::TOK_GT ||
+           tok.type == TokenType::TOK_LE || tok.type == TokenType::TOK_GE ||
+           tok.type == TokenType::TOK_EQ || tok.type == TokenType::TOK_NE) {
+        consume();
+        ExprPtr right = parseAddExpr();
+        left = std::make_unique<BinaryExpr>(tok, tok.type,
+                                            std::move(left), std::move(right));
+        tok = peek();
     }
 
     return left;

@@ -41,6 +41,11 @@ private:
     void freeAllRegs();
 
     // Utility
+    bool fitsImm12(int value) const;
+    int alignTo(int value, int alignment) const;
+    std::string scratchRegAvoiding(const std::string& reg) const;
+    void emitLoadStack(const std::string& reg, const std::string& baseReg, int offset);
+    void emitStoreStack(const std::string& valueReg, const std::string& baseReg, int offset);
     std::string opToInsn(TokenType op);
     std::string branchOpToInsn(TokenType op, bool invert = false);
 

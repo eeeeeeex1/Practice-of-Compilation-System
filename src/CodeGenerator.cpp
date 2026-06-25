@@ -2,6 +2,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <cmath>
+#include <algorithm>
 
 CodeGenerator::CodeGenerator(std::ostream& output, bool optimize)
     : m_out(output), m_optimize(optimize), m_labelCounter(0) {
@@ -23,6 +24,43 @@ void CodeGenerator::emitComment(const std::string& comment) {
 
 std::string CodeGenerator::newLabel(const std::string& prefix) {
     return prefix + std::to_string(m_labelCounter++);
+}
+
+bool CodeGenerator::fitsImm12(int value) const {
+    return value >= -2048 && value < 2048;
+}
+
+int CodeGenerator::alignTo(int value, int alignment) const {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+std::string CodeGenerator::scratchRegAvoiding(const std::string& reg) const {
+    return reg == "t0" ? "t1" : "t0";
+}
+
+void CodeGenerator::emitLoadStack(const std::string& reg,
+                                  const std::string& baseReg,
+                                  int offset) {
+    if (fitsImm12(offset)) {
+        emit("lw " + reg + ", " + std::to_string(offset) + "(" + baseReg + ")");
+        return;
+    }
+    emit("li " + reg + ", " + std::to_string(offset));
+    emit("add " + reg + ", " + baseReg + ", " + reg);
+    emit("lw " + reg + ", 0(" + reg + ")");
+}
+
+void CodeGenerator::emitStoreStack(const std::string& valueReg,
+                                   const std::string& baseReg,
+                                   int offset) {
+    if (fitsImm12(offset)) {
+        emit("sw " + valueReg + ", " + std::to_string(offset) + "(" + baseReg + ")");
+        return;
+    }
+    std::string scratch = scratchRegAvoiding(valueReg);
+    emit("li " + scratch + ", " + std::to_string(offset));
+    emit("add " + scratch + ", " + baseReg + ", " + scratch);
+    emit("sw " + valueReg + ", 0(" + scratch + ")");
 }
 
 std::string CodeGenerator::allocReg() {
@@ -100,8 +138,7 @@ void CodeGenerator::generateFuncDef(const FuncDef* func) {
     m_paramSaveOffset = -12;
 
     // Compute frame size (rounded to 16 bytes)
-    int frameSize = func->stackSize + 8;  // +8 for saved ra and fp
-    frameSize = ((frameSize + 15) / 16) * 16;  // Round up to 16-byte alignment
+    int frameSize = alignTo(func->stackSize + 8, 16);  // +8 for saved ra and fp
 
     int raOffset = frameSize - 4;
     int fpOffset = frameSize - 8;
@@ -121,24 +158,15 @@ void CodeGenerator::generateFuncDef(const FuncDef* func) {
     // Save parameters to stack
     emitComment("Save parameters");
     for (size_t i = 0; i < func->params.size(); i++) {
-        std::string aReg;
-        if (i < 8) {
-            aReg = "a" + std::to_string(i);
-        } else {
-            break;  // Only support up to 8 params for now
-        }
         int offset = func->paramOffsets[i];
-        std::string offsetStr;
-        if (offset >= -2048 && offset < 2048) {
-            offsetStr = std::to_string(offset);
+        if (i < 8) {
+            std::string aReg = "a" + std::to_string(i);
+            emitStoreStack(aReg, "fp", offset);
         } else {
-            // Need lui + addi for large offsets
-            emit("lui t0, " + std::to_string((offset >> 12) & 0xFFFFF));
-            emit("add t0, t0, fp");
-            emit("sw " + aReg + ", 0(t0)");
-            continue;
+            int incomingOffset = static_cast<int>((i - 8) * 4);
+            emitLoadStack("t0", "fp", incomingOffset);
+            emitStoreStack("t0", "fp", offset);
         }
-        emit("sw " + aReg + ", " + offsetStr + "(fp)");
     }
 
     // Generate function body
@@ -184,19 +212,11 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
 
             // Store to variable
             if (as->varIsGlobal) {
-                emit("la t0, " + as->name);
-                emit("sw " + valReg + ", 0(t0)");
+                std::string scratch = scratchRegAvoiding(valReg);
+                emit("la " + scratch + ", " + as->name);
+                emit("sw " + valReg + ", 0(" + scratch + ")");
             } else {
-                int offset = as->varOffset;
-                std::string offsetStr;
-                if (offset >= -2048 && offset < 2048) {
-                    offsetStr = std::to_string(offset);
-                    emit("sw " + valReg + ", " + offsetStr + "(fp)");
-                } else {
-                    emit("lui t0, " + std::to_string((offset >> 12) & 0xFFFFF));
-                    emit("add t0, t0, fp");
-                    emit("sw " + valReg + ", 0(t0)");
-                }
+                emitStoreStack(valReg, "fp", as->varOffset);
             }
             freeReg(valReg);
             break;
@@ -206,14 +226,7 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
             // Evaluate initializer and store
             std::string valReg = generateExpr(ds->decl->init.get());
             if (!ds->decl->isGlobal) {
-                int offset = ds->decl->varOffset;
-                if (offset >= -2048 && offset < 2048) {
-                    emit("sw " + valReg + ", " + std::to_string(offset) + "(fp)");
-                } else {
-                    emit("lui t0, " + std::to_string((offset >> 12) & 0xFFFFF));
-                    emit("add t0, t0, fp");
-                    emit("sw " + valReg + ", 0(t0)");
-                }
+                emitStoreStack(valReg, "fp", ds->decl->varOffset);
             }
             freeReg(valReg);
             break;
@@ -290,8 +303,7 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
             }
 
             // Epilogue and return
-            int frameSize = m_currentFunc->stackSize + 8;
-            frameSize = ((frameSize + 15) / 16) * 16;
+            int frameSize = alignTo(m_currentFunc->stackSize + 8, 16);
             int raOffset = frameSize - 4;
             int fpOffset = frameSize - 8;
 
@@ -323,19 +335,7 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
         case ExprKind::NUMBER: {
             auto* ne = dynamic_cast<const NumberExpr*>(expr);
             std::string reg = allocReg();
-            int val = ne->value;
-            if (val >= -2048 && val < 2048) {
-                emit("li " + reg + ", " + std::to_string(val));
-            } else {
-                // Load upper 20 bits, then add lower 12
-                int upper = (val >> 12) & 0xFFFFF;
-                int lower = val & 0xFFF;
-                if (lower & 0x800) lower |= ~0xFFF;  // sign-extend
-                emit("lui " + reg + ", " + std::to_string(upper));
-                if (lower != 0) {
-                    emit("addi " + reg + ", " + reg + ", " + std::to_string(lower));
-                }
-            }
+            emit("li " + reg + ", " + std::to_string(ne->value));
             return reg;
         }
         case ExprKind::ID: {
@@ -346,14 +346,7 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
                 emit("la " + reg + ", " + ie->name);
                 emit("lw " + reg + ", 0(" + reg + ")");
             } else {
-                int offset = ie->varOffset;
-                if (offset >= -2048 && offset < 2048) {
-                    emit("lw " + reg + ", " + std::to_string(offset) + "(fp)");
-                } else {
-                    emit("lui " + reg + ", " + std::to_string((offset >> 12) & 0xFFFFF));
-                    emit("add " + reg + ", " + reg + ", fp");
-                    emit("lw " + reg + ", 0(" + reg + ")");
-                }
+                emitLoadStack(reg, "fp", ie->varOffset);
             }
             return reg;
         }
@@ -491,65 +484,54 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
         case ExprKind::CALL: {
             auto* ce = dynamic_cast<const CallExpr*>(expr);
 
-            // Save caller-saved registers that are in use?
-            // For simplicity, save and restore t0-t6, a0-a7
-            int frameSize = 64;  // Enough to save 8 regs
+            std::vector<std::string> regsToSave = m_usedRegs;
+            int outgoingBytes = ce->args.size() > 8
+                ? static_cast<int>((ce->args.size() - 8) * 4)
+                : 0;
+            int tempSaveBase = outgoingBytes;
+            int argSaveBase = tempSaveBase + static_cast<int>(regsToSave.size() * 4);
+            int argSaveBytes = static_cast<int>(std::min<size_t>(ce->args.size(), 8) * 4);
+            int frameSize = alignTo(outgoingBytes +
+                                    static_cast<int>(regsToSave.size() * 4) +
+                                    argSaveBytes, 16);
             emit("addi sp, sp, -" + std::to_string(frameSize));
 
             // Save used temporary registers
-            int saveOffset = 0;
-            for (size_t i = 0; i < m_usedRegs.size() && i < 6; i++) {
-                emit("sw " + m_usedRegs[i] + ", " + std::to_string(saveOffset) + "(sp)");
-                saveOffset += 4;
+            for (size_t i = 0; i < regsToSave.size(); i++) {
+                emitStoreStack(regsToSave[i], "sp",
+                               tempSaveBase + static_cast<int>(i * 4));
             }
 
-            // Save argument registers (a0-a7)
-            for (int i = 0; i < 8; i++) {
-                emit("sw a" + std::to_string(i) + ", " + std::to_string(saveOffset) + "(sp)");
-                saveOffset += 4;
-            }
-
-            // Evaluate arguments into a0-a7
-            for (size_t i = 0; i < ce->args.size() && i < 8; i++) {
+            // Evaluate arguments into stack slots first so nested calls cannot
+            // clobber argument registers that were already prepared.
+            for (size_t i = 0; i < ce->args.size(); i++) {
                 std::string argReg = generateExpr(ce->args[i].get());
-                emit("mv a" + std::to_string(i) + ", " + argReg);
+                int argOffset = i < 8
+                    ? argSaveBase + static_cast<int>(i * 4)
+                    : static_cast<int>((i - 8) * 4);
+                emitStoreStack(argReg, "sp", argOffset);
                 freeReg(argReg);
+            }
+
+            for (size_t i = 0; i < ce->args.size() && i < 8; i++) {
+                emitLoadStack("a" + std::to_string(i), "sp",
+                              argSaveBase + static_cast<int>(i * 4));
             }
 
             // Call the function
             emit("call " + ce->funcName);
 
             // Result is in a0
-            std::string resultReg;
-            if (ce->type == TypeKind::VOID) {
-                resultReg = allocReg();
-                emit("mv " + resultReg + ", a0");  // discard but keep consistent
-            } else {
-                resultReg = allocReg();
-                emit("mv " + resultReg + ", a0");
-            }
+            std::string resultReg = allocReg();
+            emit("mv " + resultReg + ", a0");
 
             // Restore used registers
-            int restoreOffset = 0;
-            for (size_t i = 0; i < m_usedRegs.size() - 1 && i < 6; i++) {
-                emit("lw " + m_usedRegs[i] + ", " + std::to_string(restoreOffset) + "(sp)");
-                restoreOffset += 4;
-            }
-            // Skip the resultReg - restore the rest
-            restoreOffset = m_usedRegs.size() > 0 ? 4 * (std::min((int)m_usedRegs.size() - 1, 6)) : 0;
-
-            // Restore a0-a7
-            for (int i = 0; i < 8; i++) {
-                emit("lw a" + std::to_string(i) + ", " + std::to_string(restoreOffset) + "(sp)");
-                restoreOffset += 4;
+            for (size_t i = 0; i < regsToSave.size(); i++) {
+                emitLoadStack(regsToSave[i], "sp",
+                              tempSaveBase + static_cast<int>(i * 4));
             }
 
             emit("addi sp, sp, " + std::to_string(frameSize));
-
-            // Put a0 back (it was overwritten by the restore)
-            if (ce->type != TypeKind::VOID) {
-                emit("mv a0, " + resultReg);
-            }
 
             return resultReg;
         }
