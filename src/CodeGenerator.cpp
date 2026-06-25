@@ -105,13 +105,6 @@ void CodeGenerator::generate(const CompUnit& comp) {
     // Text section
     emit(".text");
 
-    // Entry point
-    emit(".globl _start");
-    emitLabel("_start");
-    emit("call main");
-    emit("li a7, 93");    // exit syscall
-    emit("ecall");
-
     // Generate function code
     for (auto& func : comp.functions) {
         generateFuncDef(func.get());
