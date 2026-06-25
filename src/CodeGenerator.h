@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <stack>
+#include <unordered_map>
 
 class CodeGenerator {
 public:
@@ -27,6 +28,9 @@ private:
 
     // Function code generation
     void generateFuncDef(const FuncDef* func);
+    void collectLocalRegCandidates(const Block* block, std::vector<int>& offsets);
+    void collectLocalRegCandidates(const Stmt* stmt, std::vector<int>& offsets);
+    void setupLocalRegs(const FuncDef* func);
 
     // Statement generation
     void generateStmt(const Stmt* stmt);
@@ -59,6 +63,8 @@ private:
 
     // Current function context
     const FuncDef* m_currentFunc = nullptr;
+    std::unordered_map<int, std::string> m_localRegByOffset;
+    std::vector<std::string> m_savedSRegs;
 
     // Loop context for break/continue
     struct LoopLabels {

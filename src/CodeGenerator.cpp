@@ -124,14 +124,84 @@ void CodeGenerator::generateGlobal(const Decl* decl) {
     emit(".word " + std::to_string(initVal));
 }
 
+void CodeGenerator::collectLocalRegCandidates(const Block* block, std::vector<int>& offsets) {
+    if (!block) return;
+    for (auto& stmt : block->stmts) {
+        collectLocalRegCandidates(stmt.get(), offsets);
+    }
+}
+
+void CodeGenerator::collectLocalRegCandidates(const Stmt* stmt, std::vector<int>& offsets) {
+    if (!stmt) return;
+
+    switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* bs = dynamic_cast<const BlockStmt*>(stmt);
+            collectLocalRegCandidates(bs->block.get(), offsets);
+            break;
+        }
+        case StmtKind::DECL: {
+            auto* ds = dynamic_cast<const DeclStmt*>(stmt);
+            if (ds->decl && !ds->decl->isGlobal) {
+                offsets.push_back(ds->decl->varOffset);
+            }
+            break;
+        }
+        case StmtKind::IF: {
+            auto* is = dynamic_cast<const IfStmt*>(stmt);
+            collectLocalRegCandidates(is->thenStmt.get(), offsets);
+            collectLocalRegCandidates(is->elseStmt.get(), offsets);
+            break;
+        }
+        case StmtKind::WHILE: {
+            auto* ws = dynamic_cast<const WhileStmt*>(stmt);
+            collectLocalRegCandidates(ws->body.get(), offsets);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+void CodeGenerator::setupLocalRegs(const FuncDef* func) {
+    m_localRegByOffset.clear();
+    m_savedSRegs.clear();
+
+    if (!m_optimize || !func) return;
+
+    std::vector<int> offsets;
+    for (int offset : func->paramOffsets) {
+        offsets.push_back(offset);
+    }
+    collectLocalRegCandidates(func->body.get(), offsets);
+
+    const std::vector<std::string> regs = {
+        "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
+    };
+
+    for (int offset : offsets) {
+        if (m_localRegByOffset.find(offset) != m_localRegByOffset.end()) {
+            continue;
+        }
+        if (m_savedSRegs.size() >= regs.size()) {
+            break;
+        }
+        const std::string& reg = regs[m_savedSRegs.size()];
+        m_localRegByOffset[offset] = reg;
+        m_savedSRegs.push_back(reg);
+    }
+}
+
 // === Function definition ===
 
 void CodeGenerator::generateFuncDef(const FuncDef* func) {
     m_currentFunc = func;
     m_paramSaveOffset = -12;
+    setupLocalRegs(func);
 
     // Compute frame size (rounded to 16 bytes)
-    int frameSize = alignTo(func->stackSize + 8, 16);  // +8 for saved ra and fp
+    int savedSBytes = static_cast<int>(m_savedSRegs.size() * 4);
+    int frameSize = alignTo(func->stackSize + 8 + savedSBytes, 16);  // +8 for saved ra and fp
 
     int raOffset = frameSize - 4;
     int fpOffset = frameSize - 8;
@@ -146,19 +216,31 @@ void CodeGenerator::generateFuncDef(const FuncDef* func) {
     emit("addi sp, sp, -" + std::to_string(frameSize));
     emit("sw ra, " + std::to_string(raOffset) + "(sp)");
     emit("sw fp, " + std::to_string(fpOffset) + "(sp)");
+    for (size_t i = 0; i < m_savedSRegs.size(); i++) {
+        emit("sw " + m_savedSRegs[i] + ", " + std::to_string(static_cast<int>(i * 4)) + "(sp)");
+    }
     emit("addi fp, sp, " + std::to_string(frameSize));
 
     // Save parameters to stack
     emitComment("Save parameters");
     for (size_t i = 0; i < func->params.size(); i++) {
         int offset = func->paramOffsets[i];
+        auto regIt = m_localRegByOffset.find(offset);
         if (i < 8) {
             std::string aReg = "a" + std::to_string(i);
-            emitStoreStack(aReg, "fp", offset);
+            if (regIt != m_localRegByOffset.end()) {
+                emit("mv " + regIt->second + ", " + aReg);
+            } else {
+                emitStoreStack(aReg, "fp", offset);
+            }
         } else {
             int incomingOffset = static_cast<int>((i - 8) * 4);
             emitLoadStack("t0", "fp", incomingOffset);
-            emitStoreStack("t0", "fp", offset);
+            if (regIt != m_localRegByOffset.end()) {
+                emit("mv " + regIt->second + ", t0");
+            } else {
+                emitStoreStack("t0", "fp", offset);
+            }
         }
     }
 
@@ -173,12 +255,17 @@ void CodeGenerator::generateFuncDef(const FuncDef* func) {
     // If we reach here, it's a void function or implicit return 0
     emitLabel(newLabel("func_end"));
     emitComment("Epilogue");
+    for (size_t i = 0; i < m_savedSRegs.size(); i++) {
+        emit("lw " + m_savedSRegs[i] + ", " + std::to_string(static_cast<int>(i * 4)) + "(sp)");
+    }
     emit("lw ra, " + std::to_string(raOffset) + "(sp)");
     emit("lw fp, " + std::to_string(fpOffset) + "(sp)");
     emit("addi sp, sp, " + std::to_string(frameSize));
     emit("jr ra");
 
     m_currentFunc = nullptr;
+    m_localRegByOffset.clear();
+    m_savedSRegs.clear();
 }
 
 // === Statement generation ===
@@ -209,7 +296,12 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
                 emit("la " + scratch + ", " + as->name);
                 emit("sw " + valReg + ", 0(" + scratch + ")");
             } else {
-                emitStoreStack(valReg, "fp", as->varOffset);
+                auto regIt = m_localRegByOffset.find(as->varOffset);
+                if (regIt != m_localRegByOffset.end()) {
+                    emit("mv " + regIt->second + ", " + valReg);
+                } else {
+                    emitStoreStack(valReg, "fp", as->varOffset);
+                }
             }
             freeReg(valReg);
             break;
@@ -219,7 +311,12 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
             // Evaluate initializer and store
             std::string valReg = generateExpr(ds->decl->init.get());
             if (!ds->decl->isGlobal) {
-                emitStoreStack(valReg, "fp", ds->decl->varOffset);
+                auto regIt = m_localRegByOffset.find(ds->decl->varOffset);
+                if (regIt != m_localRegByOffset.end()) {
+                    emit("mv " + regIt->second + ", " + valReg);
+                } else {
+                    emitStoreStack(valReg, "fp", ds->decl->varOffset);
+                }
             }
             freeReg(valReg);
             break;
@@ -296,10 +393,14 @@ void CodeGenerator::generateStmt(const Stmt* stmt) {
             }
 
             // Epilogue and return
-            int frameSize = alignTo(m_currentFunc->stackSize + 8, 16);
+            int savedSBytes = static_cast<int>(m_savedSRegs.size() * 4);
+            int frameSize = alignTo(m_currentFunc->stackSize + 8 + savedSBytes, 16);
             int raOffset = frameSize - 4;
             int fpOffset = frameSize - 8;
 
+            for (size_t i = 0; i < m_savedSRegs.size(); i++) {
+                emit("lw " + m_savedSRegs[i] + ", " + std::to_string(static_cast<int>(i * 4)) + "(sp)");
+            }
             emit("lw ra, " + std::to_string(raOffset) + "(sp)");
             emit("lw fp, " + std::to_string(fpOffset) + "(sp)");
             emit("addi sp, sp, " + std::to_string(frameSize));
@@ -324,6 +425,12 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
         return reg;
     }
 
+    if (m_optimize && expr->isConst) {
+        std::string reg = allocReg();
+        emit("li " + reg + ", " + std::to_string(expr->constValue));
+        return reg;
+    }
+
     switch (expr->kind) {
         case ExprKind::NUMBER: {
             auto* ne = dynamic_cast<const NumberExpr*>(expr);
@@ -339,7 +446,12 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
                 emit("la " + reg + ", " + ie->name);
                 emit("lw " + reg + ", 0(" + reg + ")");
             } else {
-                emitLoadStack(reg, "fp", ie->varOffset);
+                auto regIt = m_localRegByOffset.find(ie->varOffset);
+                if (regIt != m_localRegByOffset.end()) {
+                    emit("mv " + reg + ", " + regIt->second);
+                } else {
+                    emitLoadStack(reg, "fp", ie->varOffset);
+                }
             }
             return reg;
         }
@@ -395,6 +507,55 @@ std::string CodeGenerator::generateExpr(const Expr* expr) {
 
                 emitLabel(endLabel);
                 return resultReg;
+            }
+
+            if (m_optimize) {
+                auto emitShiftForMul = [&](const Expr* valueExpr, int factor) -> std::string {
+                    int shift = 0;
+                    int value = factor;
+                    while (value > 1 && (value % 2) == 0) {
+                        value /= 2;
+                        shift++;
+                    }
+                    if (value == 1 && shift > 0) {
+                        std::string reg = generateExpr(valueExpr);
+                        emit("slli " + reg + ", " + reg + ", " + std::to_string(shift));
+                        return reg;
+                    }
+                    return "";
+                };
+
+                if (be->right->isConst) {
+                    int rv = be->right->constValue;
+                    if ((be->op == TokenType::TOK_ADD || be->op == TokenType::TOK_SUB) && rv == 0) {
+                        return generateExpr(be->left.get());
+                    }
+                    if ((be->op == TokenType::TOK_MUL || be->op == TokenType::TOK_DIV) && rv == 1) {
+                        return generateExpr(be->left.get());
+                    }
+                    if (be->op == TokenType::TOK_MUL && rv > 1) {
+                        std::string shifted = emitShiftForMul(be->left.get(), rv);
+                        if (!shifted.empty()) {
+                            return shifted;
+                        }
+                    }
+                }
+
+                if (be->left->isConst) {
+                    int lv = be->left->constValue;
+                    if (be->op == TokenType::TOK_ADD && lv == 0) {
+                        return generateExpr(be->right.get());
+                    }
+                    if (be->op == TokenType::TOK_MUL && lv == 1) {
+                        return generateExpr(be->right.get());
+                    }
+                    if (be->op == TokenType::TOK_MUL && lv > 1) {
+                        std::string shifted = emitShiftForMul(be->right.get(), lv);
+                        if (!shifted.empty()) {
+                            return shifted;
+                        }
+                    }
+                }
             }
 
             // Normal binary operations
