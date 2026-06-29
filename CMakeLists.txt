@@ -19,6 +19,7 @@ set(SOURCES
     src/Lexer.cpp
     src/Parser.cpp
     src/SemanticAnalyzer.cpp
+    src/CompileTimeEvaluator.cpp
     src/CodeGenerator.cpp
 )
 
@@ -28,6 +29,7 @@ set(HEADERS
     src/AST.h
     src/Parser.h
     src/SemanticAnalyzer.h
+    src/CompileTimeEvaluator.h
     src/CodeGenerator.h
 )
 

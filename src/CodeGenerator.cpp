@@ -1,4 +1,5 @@
 #include "CodeGenerator.h"
+#include "CompileTimeEvaluator.h"
 #include <sstream>
 #include <stdexcept>
 #include <cmath>
@@ -109,6 +110,16 @@ void CodeGenerator::generate(const CompUnit& comp) {
     emitComment("ToyC Compiler - RISC-V 32 Assembly Output");
 
     if (m_optimize) {
+        CompileTimeEvaluator evaluator;
+        if (auto result = evaluator.evaluate(comp)) {
+            emitComment("whole-program compile-time evaluation");
+            emit(".text");
+            emit(".globl main");
+            emitLabel("main");
+            emit("li a0, " + std::to_string(*result));
+            emit("jr ra");
+            return;
+        }
         scanGlobalWrites(comp);
     }
 
