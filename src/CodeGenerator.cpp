@@ -110,13 +110,21 @@ void CodeGenerator::generate(const CompUnit& comp) {
     emitComment("ToyC Compiler - RISC-V 32 Assembly Output");
 
     if (m_optimize) {
-        CompileTimeEvaluator evaluator;
-        if (auto result = evaluator.evaluate(comp)) {
+        std::optional<std::int32_t> evaluatedResult;
+        try {
+            CompileTimeEvaluator evaluator;
+            evaluatedResult = evaluator.evaluate(comp);
+        } catch (const std::exception&) {
+            // Compile-time evaluation is opportunistic.  Resource failures
+            // must never turn an otherwise valid program into a compiler error.
+            evaluatedResult.reset();
+        }
+        if (evaluatedResult) {
             emitComment("whole-program compile-time evaluation");
             emit(".text");
             emit(".globl main");
             emitLabel("main");
-            emit("li a0, " + std::to_string(*result));
+            emit("li a0, " + std::to_string(*evaluatedResult));
             emit("jr ra");
             return;
         }
@@ -996,6 +1004,28 @@ bool CodeGenerator::exprReferencesGlobal(const Expr* expr, const std::string& na
     }
 }
 
+int CodeGenerator::expressionDepth(const Expr* expr) const {
+    if (!expr) return 0;
+    switch (expr->kind) {
+        case ExprKind::BINARY: {
+            auto* binary = dynamic_cast<const BinaryExpr*>(expr);
+            return 1 + std::max(expressionDepth(binary->left.get()),
+                                expressionDepth(binary->right.get()));
+        }
+        case ExprKind::UNARY:
+            return 1 + expressionDepth(dynamic_cast<const UnaryExpr*>(expr)->operand.get());
+        case ExprKind::CALL: {
+            int depth = 1;
+            for (const auto& arg : dynamic_cast<const CallExpr*>(expr)->args) {
+                depth = std::max(depth, 1 + expressionDepth(arg.get()));
+            }
+            return depth;
+        }
+        default:
+            return 1;
+    }
+}
+
 std::string CodeGenerator::expressionKey(const Expr* expr) const {
     if (!expr || !exprIsPure(expr)) return "";
     int constValue = 0;
@@ -1388,6 +1418,55 @@ void CodeGenerator::generateExprInto(const Expr* expr, const std::string& destRe
                 RegValue right = materializeReadOnly(binary->right.get());
                 release(right);
                 emit("mv " + destReg + ", zero");
+                return;
+            }
+
+            // Deep left-associative expressions used to retain one temporary
+            // per AST level and could exhaust t0-t6.  Accumulate them in one
+            // temporary instead; calls on the right already preserve live t
+            // registers through the normal call sequence.
+            if (expressionDepth(expr) > 6) {
+                bool temporaryDestination = destReg.size() == 2 &&
+                                            destReg[0] == 't' &&
+                                            destReg[1] >= '0' && destReg[1] <= '6';
+                if (!temporaryDestination) {
+                    std::string temporary = allocReg();
+                    generateExprInto(expr, temporary);
+                    emit("mv " + destReg + ", " + temporary);
+                    freeReg(temporary);
+                    return;
+                }
+
+                generateExprInto(binary->left.get(), destReg);
+                RegValue right = materializeReadOnly(binary->right.get());
+                switch (binary->op) {
+                    case TokenType::TOK_ADD: emit("add " + destReg + ", " + destReg + ", " + right.reg); break;
+                    case TokenType::TOK_SUB: emit("sub " + destReg + ", " + destReg + ", " + right.reg); break;
+                    case TokenType::TOK_MUL: emit("mul " + destReg + ", " + destReg + ", " + right.reg); break;
+                    case TokenType::TOK_DIV: emit("div " + destReg + ", " + destReg + ", " + right.reg); break;
+                    case TokenType::TOK_MOD: emit("rem " + destReg + ", " + destReg + ", " + right.reg); break;
+                    case TokenType::TOK_LT: emit("slt " + destReg + ", " + destReg + ", " + right.reg); break;
+                    case TokenType::TOK_GT: emit("slt " + destReg + ", " + right.reg + ", " + destReg); break;
+                    case TokenType::TOK_LE:
+                        emit("slt " + destReg + ", " + right.reg + ", " + destReg);
+                        emit("xori " + destReg + ", " + destReg + ", 1");
+                        break;
+                    case TokenType::TOK_GE:
+                        emit("slt " + destReg + ", " + destReg + ", " + right.reg);
+                        emit("xori " + destReg + ", " + destReg + ", 1");
+                        break;
+                    case TokenType::TOK_EQ:
+                        emit("sub " + destReg + ", " + destReg + ", " + right.reg);
+                        emit("seqz " + destReg + ", " + destReg);
+                        break;
+                    case TokenType::TOK_NE:
+                        emit("sub " + destReg + ", " + destReg + ", " + right.reg);
+                        emit("snez " + destReg + ", " + destReg);
+                        break;
+                    default:
+                        break;
+                }
+                release(right);
                 return;
             }
 

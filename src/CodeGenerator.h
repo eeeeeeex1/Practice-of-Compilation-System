@@ -65,6 +65,7 @@ private:
     bool getKnownConstant(const Expr* expr, int& value) const;
     bool exprReferencesLocal(const Expr* expr, int offset) const;
     bool exprReferencesGlobal(const Expr* expr, const std::string& name) const;
+    int expressionDepth(const Expr* expr) const;
     std::string expressionKey(const Expr* expr) const;
 
     // Register allocation

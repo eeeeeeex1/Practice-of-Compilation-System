@@ -3,8 +3,9 @@
 #include <bit>
 #include <limits>
 
-CompileTimeEvaluator::CompileTimeEvaluator(std::uint64_t maxSteps)
-    : m_maxSteps(maxSteps) {}
+CompileTimeEvaluator::CompileTimeEvaluator(std::uint64_t maxSteps,
+                                           std::uint64_t maxMilliseconds)
+    : m_maxSteps(maxSteps), m_maxMilliseconds(maxMilliseconds) {}
 
 std::size_t CompileTimeEvaluator::VectorHash::operator()(
     const std::vector<std::int32_t>& values) const noexcept {
@@ -18,6 +19,11 @@ std::size_t CompileTimeEvaluator::VectorHash::operator()(
 
 bool CompileTimeEvaluator::tick() {
     if (m_failed || ++m_steps > m_maxSteps) {
+        m_failed = true;
+        return false;
+    }
+    if ((m_steps & ((1U << 20) - 1)) == 0 &&
+        std::chrono::steady_clock::now() >= m_deadline) {
         m_failed = true;
         return false;
     }
@@ -72,16 +78,19 @@ std::optional<std::int32_t> CompileTimeEvaluator::evalExpr(const Expr* expr,
 
     switch (expr->kind) {
         case ExprKind::NUMBER:
-            return static_cast<std::int32_t>(dynamic_cast<const NumberExpr*>(expr)->value);
+            return static_cast<std::int32_t>(static_cast<const NumberExpr*>(expr)->value);
 
         case ExprKind::ID: {
-            auto* id = dynamic_cast<const IdExpr*>(expr);
+            auto* id = static_cast<const IdExpr*>(expr);
             if (id->varIsGlobal) {
+                auto binding = m_globalReadBindings.find(id);
+                if (binding != m_globalReadBindings.end()) return *binding->second;
                 auto it = m_globals.find(id->name);
                 if (it == m_globals.end()) {
                     fail();
                     return std::nullopt;
                 }
+                m_globalReadBindings[id] = &it->second;
                 return it->second;
             }
             auto index = localIndex(id->varOffset, frame);
@@ -90,7 +99,7 @@ std::optional<std::int32_t> CompileTimeEvaluator::evalExpr(const Expr* expr,
         }
 
         case ExprKind::UNARY: {
-            auto* unary = dynamic_cast<const UnaryExpr*>(expr);
+            auto* unary = static_cast<const UnaryExpr*>(expr);
             auto operand = evalExpr(unary->operand.get(), frame);
             if (!operand) return std::nullopt;
             switch (unary->op) {
@@ -104,7 +113,7 @@ std::optional<std::int32_t> CompileTimeEvaluator::evalExpr(const Expr* expr,
         }
 
         case ExprKind::BINARY: {
-            auto* binary = dynamic_cast<const BinaryExpr*>(expr);
+            auto* binary = static_cast<const BinaryExpr*>(expr);
             auto left = evalExpr(binary->left.get(), frame);
             if (!left) return std::nullopt;
 
@@ -152,7 +161,7 @@ std::optional<std::int32_t> CompileTimeEvaluator::evalExpr(const Expr* expr,
         }
 
         case ExprKind::CALL: {
-            auto* call = dynamic_cast<const CallExpr*>(expr);
+            auto* call = static_cast<const CallExpr*>(expr);
             std::vector<std::int32_t> args;
             args.reserve(call->args.size());
             for (const auto& argExpr : call->args) {
@@ -189,27 +198,33 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt
 
     switch (stmt->kind) {
         case StmtKind::BLOCK:
-            return execBlock(dynamic_cast<const BlockStmt*>(stmt)->block.get(), frame);
+            return execBlock(static_cast<const BlockStmt*>(stmt)->block.get(), frame);
 
         case StmtKind::EMPTY:
             return {};
 
         case StmtKind::EXPR: {
-            auto value = evalExpr(dynamic_cast<const ExprStmt*>(stmt)->expr.get(), frame);
+            auto value = evalExpr(static_cast<const ExprStmt*>(stmt)->expr.get(), frame);
             if (!value) fail();
             return {};
         }
 
         case StmtKind::ASSIGN: {
-            auto* assign = dynamic_cast<const AssignStmt*>(stmt);
+            auto* assign = static_cast<const AssignStmt*>(stmt);
             auto value = evalExpr(assign->value.get(), frame);
             if (!value) return {};
             if (assign->varIsGlobal) {
-                auto global = m_globals.find(assign->name);
-                if (global == m_globals.end()) {
-                    fail();
+                auto binding = m_globalWriteBindings.find(assign);
+                if (binding != m_globalWriteBindings.end()) {
+                    *binding->second = *value;
                 } else {
-                    global->second = *value;
+                    auto global = m_globals.find(assign->name);
+                    if (global == m_globals.end()) {
+                        fail();
+                    } else {
+                        global->second = *value;
+                        m_globalWriteBindings[assign] = &global->second;
+                    }
                 }
             } else {
                 auto index = localIndex(assign->varOffset, frame);
@@ -219,7 +234,7 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt
         }
 
         case StmtKind::DECL: {
-            const Decl* decl = dynamic_cast<const DeclStmt*>(stmt)->decl.get();
+            const Decl* decl = static_cast<const DeclStmt*>(stmt)->decl.get();
             auto value = evalExpr(decl->init.get(), frame);
             if (!value) return {};
             auto index = localIndex(decl->varOffset, frame);
@@ -228,7 +243,7 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt
         }
 
         case StmtKind::IF: {
-            auto* ifStmt = dynamic_cast<const IfStmt*>(stmt);
+            auto* ifStmt = static_cast<const IfStmt*>(stmt);
             auto condition = evalExpr(ifStmt->condition.get(), frame);
             if (!condition) return {};
             if (*condition != 0) return execStmt(ifStmt->thenStmt.get(), frame);
@@ -237,7 +252,7 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt
         }
 
         case StmtKind::WHILE: {
-            auto* whileStmt = dynamic_cast<const WhileStmt*>(stmt);
+            auto* whileStmt = static_cast<const WhileStmt*>(stmt);
             while (!m_failed) {
                 auto condition = evalExpr(whileStmt->condition.get(), frame);
                 if (!condition || *condition == 0) return {};
@@ -259,11 +274,11 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt
             return {FlowKind::CONTINUE, 0, {}};
 
         case StmtKind::RETURN: {
-            auto* returnStmt = dynamic_cast<const ReturnStmt*>(stmt);
+            auto* returnStmt = static_cast<const ReturnStmt*>(stmt);
             if (!returnStmt->hasExpr) return {FlowKind::RETURN, 0, {}};
 
             if (returnStmt->expr && returnStmt->expr->kind == ExprKind::CALL && frame.function) {
-                auto* call = dynamic_cast<const CallExpr*>(returnStmt->expr.get());
+                auto* call = static_cast<const CallExpr*>(returnStmt->expr.get());
                 if (call->funcName == frame.function->name) {
                     std::vector<std::int32_t> args;
                     args.reserve(call->args.size());
@@ -303,7 +318,7 @@ std::optional<std::int32_t> CompileTimeEvaluator::callFunction(
         }
     }
 
-    if (++m_callDepth > 4096) {
+    if (++m_callDepth > 1024) {
         --m_callDepth;
         fail();
         return std::nullopt;
@@ -346,7 +361,11 @@ std::optional<std::int32_t> CompileTimeEvaluator::callFunction(
 
     --m_callDepth;
     if (!returnValue || m_failed) return std::nullopt;
-    if (isPure) m_memoizedResults[function][originalArgs] = *returnValue;
+    if (isPure && m_memoEntryCount < 250'000) {
+        auto& cache = m_memoizedResults[function];
+        auto insertion = cache.emplace(originalArgs, *returnValue);
+        if (insertion.second) ++m_memoEntryCount;
+    }
     return returnValue;
 }
 
@@ -357,20 +376,20 @@ void CompileTimeEvaluator::collectFunctionEffects(
     if (!expr) return;
     switch (expr->kind) {
         case ExprKind::ID:
-            accessesGlobal = accessesGlobal || dynamic_cast<const IdExpr*>(expr)->varIsGlobal;
+            accessesGlobal = accessesGlobal || static_cast<const IdExpr*>(expr)->varIsGlobal;
             break;
         case ExprKind::BINARY: {
-            auto* binary = dynamic_cast<const BinaryExpr*>(expr);
+            auto* binary = static_cast<const BinaryExpr*>(expr);
             collectFunctionEffects(binary->left.get(), accessesGlobal, calls);
             collectFunctionEffects(binary->right.get(), accessesGlobal, calls);
             break;
         }
         case ExprKind::UNARY:
-            collectFunctionEffects(dynamic_cast<const UnaryExpr*>(expr)->operand.get(),
+            collectFunctionEffects(static_cast<const UnaryExpr*>(expr)->operand.get(),
                                    accessesGlobal, calls);
             break;
         case ExprKind::CALL: {
-            auto* call = dynamic_cast<const CallExpr*>(expr);
+            auto* call = static_cast<const CallExpr*>(expr);
             calls.insert(call->funcName);
             for (const auto& arg : call->args) {
                 collectFunctionEffects(arg.get(), accessesGlobal, calls);
@@ -399,38 +418,38 @@ void CompileTimeEvaluator::collectFunctionEffects(
     if (!stmt) return;
     switch (stmt->kind) {
         case StmtKind::BLOCK:
-            collectFunctionEffects(dynamic_cast<const BlockStmt*>(stmt)->block.get(),
+            collectFunctionEffects(static_cast<const BlockStmt*>(stmt)->block.get(),
                                    accessesGlobal, calls);
             break;
         case StmtKind::EXPR:
-            collectFunctionEffects(dynamic_cast<const ExprStmt*>(stmt)->expr.get(),
+            collectFunctionEffects(static_cast<const ExprStmt*>(stmt)->expr.get(),
                                    accessesGlobal, calls);
             break;
         case StmtKind::ASSIGN: {
-            auto* assign = dynamic_cast<const AssignStmt*>(stmt);
+            auto* assign = static_cast<const AssignStmt*>(stmt);
             accessesGlobal = accessesGlobal || assign->varIsGlobal;
             collectFunctionEffects(assign->value.get(), accessesGlobal, calls);
             break;
         }
         case StmtKind::DECL:
-            collectFunctionEffects(dynamic_cast<const DeclStmt*>(stmt)->decl->init.get(),
+            collectFunctionEffects(static_cast<const DeclStmt*>(stmt)->decl->init.get(),
                                    accessesGlobal, calls);
             break;
         case StmtKind::IF: {
-            auto* ifStmt = dynamic_cast<const IfStmt*>(stmt);
+            auto* ifStmt = static_cast<const IfStmt*>(stmt);
             collectFunctionEffects(ifStmt->condition.get(), accessesGlobal, calls);
             collectFunctionEffects(ifStmt->thenStmt.get(), accessesGlobal, calls);
             collectFunctionEffects(ifStmt->elseStmt.get(), accessesGlobal, calls);
             break;
         }
         case StmtKind::WHILE: {
-            auto* whileStmt = dynamic_cast<const WhileStmt*>(stmt);
+            auto* whileStmt = static_cast<const WhileStmt*>(stmt);
             collectFunctionEffects(whileStmt->condition.get(), accessesGlobal, calls);
             collectFunctionEffects(whileStmt->body.get(), accessesGlobal, calls);
             break;
         }
         case StmtKind::RETURN:
-            collectFunctionEffects(dynamic_cast<const ReturnStmt*>(stmt)->expr.get(),
+            collectFunctionEffects(static_cast<const ReturnStmt*>(stmt)->expr.get(),
                                    accessesGlobal, calls);
             break;
         default:
@@ -478,9 +497,15 @@ std::optional<std::int32_t> CompileTimeEvaluator::evaluate(const CompUnit& comp)
     m_steps = 0;
     m_callDepth = 0;
     m_failed = false;
+    m_memoEntryCount = 0;
+    m_deadline = std::chrono::steady_clock::now() +
+                 std::chrono::milliseconds(m_maxMilliseconds);
     m_functions.clear();
     m_globals.clear();
+    m_globalReadBindings.clear();
+    m_globalWriteBindings.clear();
     m_memoizedResults.clear();
+    m_globals.reserve(comp.globals.size());
 
     for (const auto& function : comp.functions) {
         m_functions[function->name] = function.get();

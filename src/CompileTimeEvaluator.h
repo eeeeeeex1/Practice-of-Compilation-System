@@ -2,6 +2,7 @@
 #define COMPILE_TIME_EVALUATOR_H
 
 #include "AST.h"
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -15,7 +16,8 @@
 // normal optimizing backend take over.
 class CompileTimeEvaluator {
 public:
-    explicit CompileTimeEvaluator(std::uint64_t maxSteps = 100'000'000);
+    explicit CompileTimeEvaluator(std::uint64_t maxSteps = 5'000'000'000ULL,
+                                  std::uint64_t maxMilliseconds = 30'000);
 
     std::optional<std::int32_t> evaluate(const CompUnit& comp);
 
@@ -71,11 +73,16 @@ private:
 
     std::uint64_t m_steps = 0;
     std::uint64_t m_maxSteps;
+    std::uint64_t m_maxMilliseconds;
+    std::chrono::steady_clock::time_point m_deadline;
     int m_callDepth = 0;
     bool m_failed = false;
+    std::size_t m_memoEntryCount = 0;
 
     std::unordered_map<std::string, const FuncDef*> m_functions;
     std::unordered_map<std::string, std::int32_t> m_globals;
+    std::unordered_map<const IdExpr*, std::int32_t*> m_globalReadBindings;
+    std::unordered_map<const AssignStmt*, std::int32_t*> m_globalWriteBindings;
     std::unordered_set<const FuncDef*> m_pureFunctions;
     std::unordered_map<
         const FuncDef*,
