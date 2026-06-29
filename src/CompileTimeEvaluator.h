@@ -17,7 +17,7 @@
 class CompileTimeEvaluator {
 public:
     explicit CompileTimeEvaluator(std::uint64_t maxSteps = 5'000'000'000ULL,
-                                  std::uint64_t maxMilliseconds = 30'000);
+                                  std::uint64_t maxMilliseconds = 15'000);
 
     std::optional<std::int32_t> evaluate(const CompUnit& comp);
 
@@ -49,7 +49,7 @@ private:
     void fail();
     std::optional<std::size_t> localIndex(int offset, const Frame& frame);
 
-    std::optional<std::int32_t> evalExpr(const Expr* expr, Frame& frame);
+    std::int32_t evalExpr(const Expr* expr, Frame& frame);
     FlowResult execStmt(const Stmt* stmt, Frame& frame);
     FlowResult execBlock(const Block* block, Frame& frame);
     std::optional<std::int32_t> callFunction(const FuncDef* function,

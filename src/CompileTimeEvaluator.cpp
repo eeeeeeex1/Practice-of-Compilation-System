@@ -22,7 +22,7 @@ bool CompileTimeEvaluator::tick() {
         m_failed = true;
         return false;
     }
-    if ((m_steps & ((1U << 20) - 1)) == 0 &&
+    if ((m_steps & ((1U << 16) - 1)) == 0 &&
         std::chrono::steady_clock::now() >= m_deadline) {
         m_failed = true;
         return false;
@@ -71,9 +71,11 @@ std::optional<std::size_t> CompileTimeEvaluator::localIndex(int offset,
     return index;
 }
 
-std::optional<std::int32_t> CompileTimeEvaluator::evalExpr(const Expr* expr,
-                                                           Frame& frame) {
-    if (!expr || !tick()) return std::nullopt;
+std::int32_t CompileTimeEvaluator::evalExpr(const Expr* expr, Frame& frame) {
+    if (!expr || m_failed) {
+        fail();
+        return 0;
+    }
     if (expr->isConst) return static_cast<std::int32_t>(expr->constValue);
 
     switch (expr->kind) {
@@ -88,75 +90,78 @@ std::optional<std::int32_t> CompileTimeEvaluator::evalExpr(const Expr* expr,
                 auto it = m_globals.find(id->name);
                 if (it == m_globals.end()) {
                     fail();
-                    return std::nullopt;
+                    return 0;
                 }
                 m_globalReadBindings[id] = &it->second;
                 return it->second;
             }
-            auto index = localIndex(id->varOffset, frame);
-            if (!index) return std::nullopt;
-            return frame.locals[*index];
+            std::size_t index = static_cast<std::size_t>((-id->varOffset - 12) / 4);
+            if (index >= frame.locals.size()) {
+                fail();
+                return 0;
+            }
+            return frame.locals[index];
         }
 
         case ExprKind::UNARY: {
             auto* unary = static_cast<const UnaryExpr*>(expr);
-            auto operand = evalExpr(unary->operand.get(), frame);
-            if (!operand) return std::nullopt;
+            std::int32_t operand = evalExpr(unary->operand.get(), frame);
+            if (m_failed) return 0;
             switch (unary->op) {
-                case TokenType::TOK_ADD: return *operand;
-                case TokenType::TOK_SUB: return neg32(*operand);
-                case TokenType::TOK_NOT: return *operand == 0 ? 1 : 0;
+                case TokenType::TOK_ADD: return operand;
+                case TokenType::TOK_SUB: return neg32(operand);
+                case TokenType::TOK_NOT: return operand == 0 ? 1 : 0;
                 default:
                     fail();
-                    return std::nullopt;
+                    return 0;
             }
         }
 
         case ExprKind::BINARY: {
             auto* binary = static_cast<const BinaryExpr*>(expr);
-            auto left = evalExpr(binary->left.get(), frame);
-            if (!left) return std::nullopt;
+            std::int32_t left = evalExpr(binary->left.get(), frame);
+            if (m_failed) return 0;
 
             if (binary->op == TokenType::TOK_AND) {
-                if (*left == 0) return 0;
-                auto right = evalExpr(binary->right.get(), frame);
-                return right ? std::optional<std::int32_t>(*right != 0 ? 1 : 0) : std::nullopt;
+                if (left == 0) return 0;
+                std::int32_t right = evalExpr(binary->right.get(), frame);
+                return m_failed ? 0 : (right != 0 ? 1 : 0);
             }
             if (binary->op == TokenType::TOK_OR) {
-                if (*left != 0) return 1;
-                auto right = evalExpr(binary->right.get(), frame);
-                return right ? std::optional<std::int32_t>(*right != 0 ? 1 : 0) : std::nullopt;
+                if (left != 0) return 1;
+                std::int32_t right = evalExpr(binary->right.get(), frame);
+                return m_failed ? 0 : (right != 0 ? 1 : 0);
             }
 
-            auto right = evalExpr(binary->right.get(), frame);
-            if (!right) return std::nullopt;
+            std::int32_t right = evalExpr(binary->right.get(), frame);
+            if (m_failed) return 0;
             switch (binary->op) {
-                case TokenType::TOK_ADD: return add32(*left, *right);
-                case TokenType::TOK_SUB: return sub32(*left, *right);
-                case TokenType::TOK_MUL: return mul32(*left, *right);
+                case TokenType::TOK_ADD: return add32(left, right);
+                case TokenType::TOK_SUB: return sub32(left, right);
+                case TokenType::TOK_MUL: return mul32(left, right);
                 case TokenType::TOK_DIV:
-                    if (*right == 0 ||
-                        (*left == std::numeric_limits<std::int32_t>::min() && *right == -1)) {
+                    if (right == 0 ||
+                        (left == std::numeric_limits<std::int32_t>::min() && right == -1)) {
                         fail();
-                        return std::nullopt;
+                        return 0;
                     }
-                    return static_cast<std::int32_t>(*left / *right);
+                    return static_cast<std::int32_t>(left / right);
                 case TokenType::TOK_MOD:
-                    if (*right == 0 ||
-                        (*left == std::numeric_limits<std::int32_t>::min() && *right == -1)) {
+                    if (right == 0 ||
+                        (left == std::numeric_limits<std::int32_t>::min() && right == -1)) {
                         fail();
-                        return std::nullopt;
+                        return 0;
                     }
-                    return static_cast<std::int32_t>(*left % *right);
-                case TokenType::TOK_LT: return *left < *right ? 1 : 0;
-                case TokenType::TOK_GT: return *left > *right ? 1 : 0;
-                case TokenType::TOK_LE: return *left <= *right ? 1 : 0;
-                case TokenType::TOK_GE: return *left >= *right ? 1 : 0;
-                case TokenType::TOK_EQ: return *left == *right ? 1 : 0;
-                case TokenType::TOK_NE: return *left != *right ? 1 : 0;
+                    return static_cast<std::int32_t>(left % right);
+                case TokenType::TOK_LT: return left < right ? 1 : 0;
+                case TokenType::TOK_GT: return left > right ? 1 : 0;
+                case TokenType::TOK_LE: return left <= right ? 1 : 0;
+                case TokenType::TOK_GE: return left >= right ? 1 : 0;
+                case TokenType::TOK_EQ: return left == right ? 1 : 0;
+                case TokenType::TOK_NE: return left != right ? 1 : 0;
                 default:
                     fail();
-                    return std::nullopt;
+                    return 0;
             }
         }
 
@@ -165,21 +170,22 @@ std::optional<std::int32_t> CompileTimeEvaluator::evalExpr(const Expr* expr,
             std::vector<std::int32_t> args;
             args.reserve(call->args.size());
             for (const auto& argExpr : call->args) {
-                auto arg = evalExpr(argExpr.get(), frame);
-                if (!arg) return std::nullopt;
-                args.push_back(*arg);
+                args.push_back(evalExpr(argExpr.get(), frame));
+                if (m_failed) return 0;
             }
             auto function = m_functions.find(call->funcName);
             if (function == m_functions.end()) {
                 fail();
-                return std::nullopt;
+                return 0;
             }
-            return callFunction(function->second, args);
+            auto result = callFunction(function->second, args);
+            if (!result) return 0;
+            return *result;
         }
     }
 
     fail();
-    return std::nullopt;
+    return 0;
 }
 
 CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execBlock(const Block* block,
@@ -194,7 +200,7 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execBlock(const Block* bl
 
 CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt,
                                                                  Frame& frame) {
-    if (!stmt || !tick()) return {};
+    if (!stmt || m_failed) return {};
 
     switch (stmt->kind) {
         case StmtKind::BLOCK:
@@ -204,49 +210,56 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt
             return {};
 
         case StmtKind::EXPR: {
-            auto value = evalExpr(static_cast<const ExprStmt*>(stmt)->expr.get(), frame);
-            if (!value) fail();
+            evalExpr(static_cast<const ExprStmt*>(stmt)->expr.get(), frame);
             return {};
         }
 
         case StmtKind::ASSIGN: {
             auto* assign = static_cast<const AssignStmt*>(stmt);
-            auto value = evalExpr(assign->value.get(), frame);
-            if (!value) return {};
+            std::int32_t value = evalExpr(assign->value.get(), frame);
+            if (m_failed) return {};
             if (assign->varIsGlobal) {
                 auto binding = m_globalWriteBindings.find(assign);
                 if (binding != m_globalWriteBindings.end()) {
-                    *binding->second = *value;
+                    *binding->second = value;
                 } else {
                     auto global = m_globals.find(assign->name);
                     if (global == m_globals.end()) {
                         fail();
                     } else {
-                        global->second = *value;
+                        global->second = value;
                         m_globalWriteBindings[assign] = &global->second;
                     }
                 }
             } else {
-                auto index = localIndex(assign->varOffset, frame);
-                if (index) frame.locals[*index] = *value;
+                std::size_t index = static_cast<std::size_t>((-assign->varOffset - 12) / 4);
+                if (index >= frame.locals.size()) {
+                    fail();
+                } else {
+                    frame.locals[index] = value;
+                }
             }
             return {};
         }
 
         case StmtKind::DECL: {
             const Decl* decl = static_cast<const DeclStmt*>(stmt)->decl.get();
-            auto value = evalExpr(decl->init.get(), frame);
-            if (!value) return {};
-            auto index = localIndex(decl->varOffset, frame);
-            if (index) frame.locals[*index] = *value;
+            std::int32_t value = evalExpr(decl->init.get(), frame);
+            if (m_failed) return {};
+            std::size_t index = static_cast<std::size_t>((-decl->varOffset - 12) / 4);
+            if (index >= frame.locals.size()) {
+                fail();
+            } else {
+                frame.locals[index] = value;
+            }
             return {};
         }
 
         case StmtKind::IF: {
             auto* ifStmt = static_cast<const IfStmt*>(stmt);
-            auto condition = evalExpr(ifStmt->condition.get(), frame);
-            if (!condition) return {};
-            if (*condition != 0) return execStmt(ifStmt->thenStmt.get(), frame);
+            std::int32_t condition = evalExpr(ifStmt->condition.get(), frame);
+            if (m_failed) return {};
+            if (condition != 0) return execStmt(ifStmt->thenStmt.get(), frame);
             if (ifStmt->elseStmt) return execStmt(ifStmt->elseStmt.get(), frame);
             return {};
         }
@@ -254,8 +267,9 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt
         case StmtKind::WHILE: {
             auto* whileStmt = static_cast<const WhileStmt*>(stmt);
             while (!m_failed) {
-                auto condition = evalExpr(whileStmt->condition.get(), frame);
-                if (!condition || *condition == 0) return {};
+                if (!tick()) return {};
+                std::int32_t condition = evalExpr(whileStmt->condition.get(), frame);
+                if (m_failed || condition == 0) return {};
                 FlowResult body = execStmt(whileStmt->body.get(), frame);
                 if (m_failed) return {};
                 if (body.kind == FlowKind::BREAK) return {};
@@ -283,17 +297,16 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt
                     std::vector<std::int32_t> args;
                     args.reserve(call->args.size());
                     for (const auto& argExpr : call->args) {
-                        auto arg = evalExpr(argExpr.get(), frame);
-                        if (!arg) return {};
-                        args.push_back(*arg);
+                        args.push_back(evalExpr(argExpr.get(), frame));
+                        if (m_failed) return {};
                     }
                     return {FlowKind::TAIL_CALL, 0, std::move(args)};
                 }
             }
 
-            auto value = evalExpr(returnStmt->expr.get(), frame);
-            if (!value) return {};
-            return {FlowKind::RETURN, *value, {}};
+            std::int32_t value = evalExpr(returnStmt->expr.get(), frame);
+            if (m_failed) return {};
+            return {FlowKind::RETURN, value, {}};
         }
     }
 
@@ -304,7 +317,7 @@ CompileTimeEvaluator::FlowResult CompileTimeEvaluator::execStmt(const Stmt* stmt
 std::optional<std::int32_t> CompileTimeEvaluator::callFunction(
     const FuncDef* function,
     const std::vector<std::int32_t>& args) {
-    if (!function || args.size() != function->params.size() || !tick()) {
+    if (!function || args.size() != function->params.size()) {
         fail();
         return std::nullopt;
     }
@@ -329,6 +342,7 @@ std::optional<std::int32_t> CompileTimeEvaluator::callFunction(
     std::optional<std::int32_t> returnValue;
 
     while (!m_failed) {
+        if (!tick()) break;
         Frame frame;
         frame.function = function;
         frame.locals.resize(static_cast<std::size_t>(function->stackSize / 4), 0);
@@ -514,9 +528,9 @@ std::optional<std::int32_t> CompileTimeEvaluator::evaluate(const CompUnit& comp)
 
     Frame globalFrame;
     for (const auto& global : comp.globals) {
-        auto value = evalExpr(global->init.get(), globalFrame);
-        if (!value) return std::nullopt;
-        m_globals[global->name] = *value;
+        std::int32_t value = evalExpr(global->init.get(), globalFrame);
+        if (m_failed) return std::nullopt;
+        m_globals[global->name] = value;
     }
 
     auto mainFunction = m_functions.find("main");
